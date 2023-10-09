@@ -1,6 +1,7 @@
 <?php
 namespace benf\neo;
 
+use benf\neo\listeners\CraftQLGetFieldSchema;
 use yii\base\Event;
 
 use Craft;
