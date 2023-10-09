@@ -1,6 +1,7 @@
 <?php
 namespace benf\neo;
 
+use benf\neo\Plugin as Neo;
 use Craft;
 use craft\base\EagerLoadingFieldInterface;
 use craft\base\Element;
@@ -9,14 +10,19 @@ use craft\base\Field as BaseField;
 use craft\db\Query;
 use craft\elements\db\ElementQueryInterface;
 use craft\helpers\ArrayHelper;
+use craft\helpers\ElementHelper;
 use craft\validators\ArrayValidator;
+use craft\queue\jobs\ResaveElements;
+use craft\services\Elements;
 
-use benf\neo\Plugin as Neo;
-use benf\neo\models\BlockType;
-use benf\neo\models\BlockTypeGroup;
+use benf\neo\assets\FieldAsset;
 use benf\neo\elements\Block;
 use benf\neo\elements\db\BlockQuery;
-use benf\neo\assets\FieldAsset;
+use benf\neo\models\BlockStructure;
+use benf\neo\models\BlockType;
+use benf\neo\models\BlockTypeGroup;
+use benf\neo\validators\FieldValidator;
+use yii\db\Exception;
 
 /**
  * Class Field
@@ -28,6 +34,11 @@ use benf\neo\assets\FieldAsset;
  */
 class Field extends BaseField implements EagerLoadingFieldInterface
 {
+    const PROPAGATION_METHOD_NONE = 'none';
+    const PROPAGATION_METHOD_SITE_GROUP = 'siteGroup';
+    const PROPAGATION_METHOD_LANGUAGE = 'language';
+    const PROPAGATION_METHOD_ALL = 'all';
+
 	/**
 	 * @inheritdoc
 	 */
@@ -56,8 +67,24 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 
 	/**
 	 * @var bool Whether this field is translatable.
+     * @deprecated in 3.2. Use [[$propagationMethod]] instead
 	 */
 	public $localizeBlocks = false;
+
+	/**
+	 * @var int|null The minimum number of blocks this field can have.
+	 */
+	public $minBlocks;
+
+	/**
+	 * @var int|null The maximum number of blocks this field can have.
+	 */
+	public $maxBlocks;
+
+	/**
+	 * @var int|null The maximum number of top-level blocks this field can have.
+	 */
+	public $maxTopBlocks;
 
 	/**
 	 * @var array|null The block types associated with this field.
@@ -69,26 +96,75 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 	 */
 	private $_blockTypeGroups;
 
+    /**
+     * @var string Propagation method
+     *
+     * This will be set to one of the following:
+     *
+     * - `none` – Only save b locks in the site they were created in
+     * - `siteGroup` – Save  blocks to other sites in the same site group
+     * - `language` – Save blocks to other sites with the same language
+     * - `all` – Save blocks to all sites supported by the owner element
+     *
+     * @since 2.4.0
+     */
+    public $propagationMethod = self::PROPAGATION_METHOD_ALL;
+
+    /**
+     * @var string The old propagation method for this field
+     */
+    private $_oldPropagationMethod;
+
+    // Public Methods
+    // =========================================================================
+    /**
+     * @inheritdoc
+     */
+    public function __construct($config = [])
+    {
+        if (array_key_exists('localizeBlocks', $config)) {
+            $config['propagationMethod'] = $config['localizeBlocks'] ? 'none' : 'all';
+            unset($config['localizeBlocks']);
+        }
+        parent::__construct($config);
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function init()
+    {
+        // Set localizeBlocks in case anything is still checking it
+        $this->localizeBlocks = $this->propagationMethod === self::PROPAGATION_METHOD_NONE;
+        parent::init();
+    }
+
+    /**
+     * @inheritdoc
+     */
+    public function settingsAttributes(): array
+    {
+        return ArrayHelper::withoutValue(parent::settingsAttributes(), 'localizeBlocks');
+    }
+
 	/**
 	 * @inheritdoc
 	 */
 	public function rules(): array
 	{
 		$rules = parent::rules();
-		$rules[] = [['minBlocks', 'maxBlocks'], 'integer', 'min' => 0];
+        $rules[] = [
+            ['propagationMethod'], 'in', 'range' => [
+                self::PROPAGATION_METHOD_NONE,
+                self::PROPAGATION_METHOD_SITE_GROUP,
+                self::PROPAGATION_METHOD_LANGUAGE,
+                self::PROPAGATION_METHOD_ALL
+            ]
+        ];
+		$rules[] = [['minBlocks', 'maxBlocks', 'maxTopBlocks'], 'integer', 'min' => 0];
 
 		return $rules;
 	}
-
-	/**
-	 * @var int|null The minimum number of blocks this field can have.
-	 */
-	public $minBlocks;
-
-	/**
-	 * @var int|null The maximum number of blocks this field can have.
-	 */
-	public $maxBlocks;
 
 	/**
 	 * Returns this field's block types.
@@ -154,6 +230,22 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 
 					$fieldLayout = Craft::$app->getFields()->assembleLayout($fieldLayoutPost, $requiredFieldPost);
 					$fieldLayout->type = Block::class;
+
+					// Ensure the field layout ID is set, if it exists
+					if (is_int($blockTypeId))
+					{
+						$layoutIdResult = (new Query)
+							->select(['fieldLayoutId'])
+							->from('{{%neoblocktypes}}')
+							->where(['id' => $blockTypeId])
+							->one();
+
+						if ($layoutIdResult !== null)
+						{
+							$fieldLayout->id = $layoutIdResult['fieldLayoutId'];
+						}
+					}
+
 					$newBlockType->setFieldLayout($fieldLayout);
 				}
 			}
@@ -277,39 +369,59 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 
 		if ($value instanceof ElementQueryInterface)
 		{
-			$query = $value;
+			return $value;
 		}
-		else
-		{
-			$query = Block::find();
 
-			// Existing element?
-			if ($element && $element->id)
-			{
-				$query->ownerId($element->id);
-			}
-			else
-			{
-				$query->id(false);
-			}
+        $query = Block::find();
+        $blockStructure = null;
 
-			$query
-				->fieldId($this->id)
-				->siteId($element->siteId ?? null);
+        // Existing element?
+        $existingElement = $element && $element->id;
+        if ($existingElement)
+        {
+            $query->ownerId($element->id);
+        }
+        else
+        {
+            $query->id(false);
+        }
 
-			// Set the initially matched elements if $value is already set, which is the case if there was a validation
-			// error or we're loading an entry revision.
-			if (is_array($value) || $value === '')
-			{
-				$elements = $this->_createBlocksFromSerializedData($value, $element);
+        $query->fieldId($this->id)->siteId($element->siteId ?? null);
 
-				$query->status = null;
-				$query->enabledForSite = false;
-				$query->limit = null;
-				$query->setCachedResult($elements);
-				$query->setAllElements($elements);
-			}
-		}
+        // If an owner element exists, set the appropriate owner site ID and block structure, depending on whether
+        // the field is set to manage blocks on a per-site basis
+        if ($existingElement)
+        {
+            $blockStructure = Neo::$plugin->blocks->getStructure($this->id, $element->id, (int)$element->siteId);
+        }
+
+        // If we found the block structure, set the query's structure ID
+        if ($blockStructure)
+        {
+            $query->structureId($blockStructure->structureId);
+        }
+
+//        throw new \Exception(print_r($query, true));
+
+        // Set the initially matched elements if $value is already set, which is the case if there was a validation
+        // error or we're loading an entry revision.
+        if (is_array($value) || $value === '')
+        {
+            $elements = $this->_createBlocksFromSerializedData($value, $element);
+
+            if (!Craft::$app->getRequest()->getIsLivePreview())
+            {
+                $query->anyStatus();
+            }
+            else
+            {
+                $query->status = Element::STATUS_ENABLED;
+            }
+
+            $query->limit = null;
+            $query->setCachedResult($elements);
+            $query->useMemoized($elements);
+        }
 
 		return $query;
 	}
@@ -340,37 +452,37 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 	/**
 	 * @inheritdoc
 	 */
-	public function modifyElementsQuery(ElementQueryInterface $query, $value)
-	{
-		if ($value === 'not :empty:')
-		{
-			$value = ':notempty:';
-		}
-
-		if ($value === ':notempty:' || $value === ':empty:')
-		{
-			$alias = 'neoblocks_' . $this->handle;
-			$operator = $value === ':notempty:' ? '!=' : '=';
-
-			$query->subQuery->andWhere(
-				"(select count([[{$alias}.id]]) from {{%neoblocks}} {{{$alias}}} where [[{$alias}.ownerId]] = [[elements.id]] and [[{$alias}.fieldId]] = :fieldId) {$operator} 0",
-				[':fieldId' => $this->id]
-			);
-		}
-		elseif ($value !== null)
-		{
-			return false;
-		}
-
-		return null;
-	}
+//	public function modifyElementsQuery(ElementQueryInterface $query, $value)
+//	{
+//		if ($value === 'not :empty:')
+//		{
+//			$value = ':notempty:';
+//		}
+//
+//		if ($value === ':notempty:' || $value === ':empty:')
+//		{
+//			$alias = 'neoblocks_' . $this->handle;
+//			$operator = $value === ':notempty:' ? '!=' : '=';
+//
+//			$query->subQuery->andWhere(
+//				"(select count([[{$alias}.id]]) from {{%neoblocks}} {{{$alias}}} where [[{$alias}.ownerId]] = [[elements.id]] and [[{$alias}.fieldId]] = :fieldId) {$operator} 0",
+//				[':fieldId' => $this->id]
+//			);
+//		}
+//		elseif ($value !== null)
+//		{
+//			return false;
+//		}
+//
+//		return null;
+//	}
 
 	/**
 	 * @inheritdoc
 	 */
 	public function getIsTranslatable(ElementInterface $element = null): bool
 	{
-		return $this->localizeBlocks;
+		return $this->propagationMethod !== self::PROPAGATION_METHOD_ALL;
 	}
 
 	/**
@@ -387,6 +499,11 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 				'tooFew' => Craft::t('neo', '{attribute} should contain at least {min, number} {min, plural, one{block} other{blocks}}.'),
 				'tooMany' => Craft::t('neo', '{attribute} should contain at most {max, number} {max, plural, one{block} other{blocks}}.'),
 				'skipOnEmpty' => false,
+				'on' => Element::SCENARIO_LIVE,
+			],
+			[
+				FieldValidator::class,
+				'maxTopBlocks' => $this->maxTopBlocks ?: null,
 				'on' => Element::SCENARIO_LIVE,
 			],
 		];
@@ -465,19 +582,6 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 					'and',
 					'[[neoblockstructures.ownerId]] = [[neoblocks.ownerId]]',
 					'[[neoblockstructures.fieldId]] = [[neoblocks.fieldId]]',
-					[
-						'or',
-						'[[neoblockstructures.ownerSiteId]] = [[neoblocks.ownerSiteId]]',
-
-						// If there is no site ID set (in other words, `ownerSiteId` is `null`), then the above
-						// comparison will not be true for some reason. So if it's not evaluated to true, then check
-						// to see if both `ownerSiteId` properties are `null`.
-						[
-							'and',
-							'[[neoblockstructures.ownerSiteId]] is null',
-							'[[neoblocks.ownerSiteId]] is null',
-						],
-					],
 				]
 			)
 			->leftJoin(
@@ -505,6 +609,21 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 	{
 		Neo::$plugin->fields->save($this);
 
+        // If the propagation method just changed, resave all the Matrix blocks
+        if ($this->_oldPropagationMethod && $this->propagationMethod !== $this->_oldPropagationMethod) {
+            Craft::$app->getQueue()->push(new ResaveElements([
+                'elementType' => Block::class,
+                'criteria' => [
+                    'fieldId' => $this->id,
+                    'siteId' => '*',
+                    'unique' => true,
+                    'status' => null,
+                    'enabledForSite' => false,
+                ]
+            ]));
+            $this->_oldPropagationMethod = null;
+        }
+
 		parent::afterSave($isNew);
 	}
 
@@ -521,38 +640,142 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 	/**
 	 * @inheritdoc
 	 */
-	public function afterElementSave(ElementInterface $element, bool $isNew)
-	{
-		Neo::$plugin->fields->saveValue($this, $element, $isNew);
+  
+//	public function afterElementSave(ElementInterface $element, bool $isNew)
+//	{
+//		Neo::$plugin->fields->saveValue($this, $element);
+//
+//		parent::afterElementSave($element, $isNew);
+//	}
 
-		parent::afterElementSave($element, $isNew);
-	}
+    /**
+     * @inheritdoc
+     */
+    public function afterElementPropagate(ElementInterface $element, bool $isNew)
+    {
+        /** @var Element $element */
+        if ($element->duplicateOf !== null) {
+             Neo::$plugin->fields->duplicateBlocks($this, $element->duplicateOf, $element, true);
+        } else {
+            Neo::$plugin->fields->saveValue($this, $element, $isNew);
+        }
+
+        // Reset the field value if this is a new element
+        if ($element->duplicateOf || $isNew) {
+            $element->setFieldValue($this->handle, null);
+        }
+
+        parent::afterElementPropagate($element, $isNew);
+    }
 
 	/**
 	 * @inheritdoc
 	 */
 	public function beforeElementDelete(ElementInterface $element): bool
 	{
+		if (!parent::beforeElementDelete($element))
+		{
+			return false;
+		}
+
 		$sitesService = Craft::$app->getSites();
 		$elementsService = Craft::$app->getElements();
 
+		// Craft hard-deletes element structure nodes even when soft-deleting an element, which means we lose all Neo
+		// field structure data (i.e. block order, levels) when its owner is soft-deleted.  We need to get all block
+		// structures for this field/owner before soft-deleting the blocks, and re-save them after the blocks are
+		// soft-deleted, so the blocks can be restored correctly if the owner element is restored.
+		$blockStructures = [];
+		$blocksBySite = [];
+
+		// Get the structures for each site
+		$structureRows = (new Query())
+			->select([
+				'id',
+				'structureId',
+                'ownerSiteId',
+				'ownerId',
+				'fieldId',
+			])
+			->from(['{{%neoblockstructures}}'])
+			->where([
+				'fieldId' => $this->id,
+				'ownerId' => $element->id,
+			])
+			->all();
+
+		foreach ($structureRows as $row)
+		{
+			$blockStructures[] = new BlockStructure($row);
+		}
+
+		// Get the blocks for each structure
+		foreach ($blockStructures as $blockStructure)
+		{
+			// Site IDs start from 1 -- let's treat non-localized blocks as site 0
+			$key = $blockStructure->ownerSiteId ?? 0;
+			$blocksBySite[$key] = Block::find()
+				->anyStatus()
+				->fieldId($this->id)
+				->owner($element)
+				->all();
+		}
+
+		// Delete all Neo blocks for this element and field
 		foreach ($sitesService->getAllSiteIds() as $siteId)
 		{
-			$query = Block::find();
-			$query->anyStatus();
-			$query->siteId($siteId);
-			$query->owner($element);
-			$query->inReverse();
-
-			$blocks = $query->all();
+			$blocks = Block::find()
+				->anyStatus()
+				->fieldId($this->id)
+				->siteId($siteId)
+				->owner($element)
+				->inReverse()
+				->all();
 
 			foreach ($blocks as $block)
 			{
+				$block->deletedWithOwner = true;
 				$elementsService->deleteElement($block);
 			}
 		}
 
-		return parent::beforeElementDelete($element);
+		// Recreate the block structures with the original block data
+		foreach ($blockStructures as $blockStructure)
+		{
+			$key = $blockStructure->ownerSiteId ?? 0;
+			Neo::$plugin->blocks->saveStructure($blockStructure);
+			Neo::$plugin->blocks->buildStructure($blocksBySite[$key], $blockStructure);
+		}
+
+		return true;
+	}
+
+	/**
+	 * @inheritdoc
+	 */
+	public function afterElementRestore(ElementInterface $element)
+	{
+		$elementsService = Craft::$app->getElements();
+		$supportedSites = ElementHelper::supportedSitesForElement($element);
+
+		// Restore the Neo blocks that were deleted with $element
+		foreach ($supportedSites as $supportedSite)
+		{
+			$blocks = Block::find()
+				->anyStatus()
+				->siteId($supportedSite['siteId'])
+				->owner($element)
+				->trashed()
+				->andWhere(['neoblocks.deletedWithOwner' => true])
+				->all();
+
+			foreach ($blocks as $block)
+			{
+				$elementsService->restoreElement($block);
+			}
+		}
+
+		parent::afterElementRestore($element);
 	}
 
 	/**
@@ -596,10 +819,7 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 
 		if ($value instanceof BlockQuery)
 		{
-			$value = $value
-				->limit(null)
-				->anyStatus()
-				->all();
+			$value = $value->getCachedResult() ?? $value->limit(null)->anyStatus()->all();
 		}
 
 		$siteId = $element !== null ? $element->siteId : null;
@@ -620,7 +840,7 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 				'neoField' => $this,
 				'id' => $viewService->formatInputId($this->handle),
 				'name' => $this->handle,
-				'translatable' => $this->localizeBlocks,
+				'translatable' => $this->propagationMethod,
 				'static' => $static,
 			]);
 		}
@@ -637,133 +857,140 @@ class Field extends BaseField implements EagerLoadingFieldInterface
 	 */
 	private function _createBlocksFromSerializedData($value, ElementInterface $element = null): array
 	{
+        if (!is_array($value)) {
+            return [];
+        }
+
 		$requestService = Craft::$app->getRequest();
 
 		$blocks = [];
 
-		if (is_array($value))
-		{
-			$oldBlocksById = [];
-			$blockTypes = ArrayHelper::index(Neo::$plugin->blockTypes->getByFieldId($this->id), 'handle');
-			$prevBlock = null;
-			
-			if ($element && $element->id)
-			{
-				$ownerId = $element->id;
-				$blockIds = [];
+        $oldBlocksById = [];
+        $blockTypes = ArrayHelper::index(Neo::$plugin->blockTypes->getByFieldId($this->id), 'handle');
+        $prevBlock = null;
 
-				foreach (array_keys($value) as $blockId)
-				{
-					if (is_numeric($blockId) && $blockId !== 0)
-					{
-						$blockIds[] = $blockId;
-					}
-				}
+        if ($element && $element->id)
+        {
+            $ownerId = $element->id;
+            $blockIds = [];
 
-				if (!empty($blockIds))
-				{
-					$oldBlocksQuery = Block::find();
-					$oldBlocksQuery->fieldId($this->id);
-					$oldBlocksQuery->ownerId($ownerId);
-					$oldBlocksQuery->id($blockIds);
-					$oldBlocksQuery->limit(null);
-					$oldBlocksQuery->anyStatus();
-					$oldBlocksQuery->siteId($element->siteId);
-					$oldBlocksQuery->indexBy('id');
+            foreach (array_keys($value) as $blockId)
+            {
+                if (is_numeric($blockId) && $blockId !== 0)
+                {
+                    $blockIds[] = $blockId;
 
-					$oldBlocksById = $oldBlocksQuery->all();
-				}
-			}
-			else
-			{
-				$ownerId = null;
-			}
+                    // If that block was duplicated earlier in this request, check for that as well.
+                    if (isset(Elements::$duplicatedElementIds[$blockId])) {
+                        $blockIds[] = Elements::$duplicatedElementIds[$blockId];
+                    }
+                }
+            }
 
-			// Generally, block data will be received with levels starting from 0, so they need to be adjusted up by 1.
-			// For entry revisions and new entry drafts, though, the block data will have levels starting from 1.
-			// Because the first block in a field will always be level 1, we can use that to check whether the count is
-			// starting from 0 or 1 and thus ensure that all blocks display at the correct level.
-			$adjustLevels = false;
+            if (!empty($blockIds))
+            {
+                $oldBlocksQuery = Block::find();
+                $oldBlocksQuery->fieldId($this->id);
+                $oldBlocksQuery->ownerId($ownerId);
+                $oldBlocksQuery->id($blockIds);
+                $oldBlocksQuery->limit(null);
+                $oldBlocksQuery->anyStatus();
+                $oldBlocksQuery->siteId($element->siteId);
+                $oldBlocksQuery->indexBy('id');
+                $oldBlocksById = $oldBlocksQuery->all();
+            }
+        }
+        else
+        {
+            $ownerId = null;
+        }
 
-			if (!empty($value))
-			{
-				$firstBlock = reset($value);
-				$firstBlockLevel = (int)$firstBlock['level'];
+        // Generally, block data will be received with levels starting from 0, so they need to be adjusted up by 1.
+        // For entry revisions and new entry drafts, though, the block data will have levels starting from 1.
+        // Because the first block in a field will always be level 1, we can use that to check whether the count is
+        // starting from 0 or 1 and thus ensure that all blocks display at the correct level.
+        $adjustLevels = false;
 
-				if ($firstBlockLevel === 0)
-				{
-					$adjustLevels = true;
-				}
-			}
+        if (!empty($value))
+        {
+            $firstBlock = reset($value);
+            $firstBlockLevel = (int)$firstBlock['level'];
 
-			foreach ($value as $blockId => $blockData)
-			{
-				$blockTypeHandle = isset($blockData['type']) ? $blockData['type'] : null;
-				$blockType = $blockTypeHandle && isset($blockTypes[$blockTypeHandle]) ? $blockTypes[$blockTypeHandle] : null;
-				$blockFields = isset($blockData['fields']) ? $blockData['fields'] : null;
+            if ($firstBlockLevel === 0)
+            {
+                $adjustLevels = true;
+            }
+        }
 
-				$isEnabled = isset($blockData['enabled']) ? (bool)$blockData['enabled'] : true;
-				$isCollapsed = isset($blockData['collapsed']) ? (bool)$blockData['collapsed'] : false;
-				$isNew = strpos($blockId, 'new') === 0;
-				$isDeleted = !isset($oldBlocksById[$blockId]);
+        foreach ($value as $blockId => $blockData)
+        {
+            $blockTypeHandle = isset($blockData['type']) ? $blockData['type'] : null;
+            $blockType = $blockTypeHandle && isset($blockTypes[$blockTypeHandle]) ? $blockTypes[$blockTypeHandle] : null;
+            $blockFields = isset($blockData['fields']) ? $blockData['fields'] : null;
 
-				if ($blockType)
-				{
-					// Adjust block levels to their correct value if necessary.
-					$blockLevel = (int)$blockData['level'];
+            $isEnabled = isset($blockData['enabled']) ? (bool)$blockData['enabled'] : true;
+            $isCollapsed = isset($blockData['collapsed']) ? (bool)$blockData['collapsed'] : false;
+            $isModified = isset($blockData['modified']) ? (bool)$blockData['modified'] : false;
+            $isNew = strpos($blockId, 'new') === 0;
+            $isDeleted = !isset($oldBlocksById[$blockId]);
 
-					if ($adjustLevels)
-					{
-						$blockLevel++;
-					}
+            if ($blockType)
+            {
+                // Adjust block levels to their correct value if necessary.
+                $blockLevel = (int)$blockData['level'];
 
-					if ($isNew || $isDeleted)
-					{
-						$block = new Block();
-						$block->fieldId = $this->id;
-						$block->typeId = $blockType->id;
-						$block->ownerId = $ownerId;
-						$block->siteId = $element->siteId;
-					}
-					else
-					{
-						$block = $oldBlocksById[$blockId];
-					}
+                if ($adjustLevels)
+                {
+                    $blockLevel++;
+                }
 
-					$block->setOwner($element);
-					$block->setCollapsed($isCollapsed);
-					$block->enabled = $isEnabled;
-					$block->level = $blockLevel;
+                if ($isNew || $isDeleted)
+                {
+                    $block = new Block();
+                    $block->fieldId = $this->id;
+                    $block->typeId = $blockType->id;
+                    $block->ownerId = $ownerId;
+                    $block->siteId = $element->siteId;
+                }
+                else
+                {
+                    $block = $oldBlocksById[$blockId];
+                }
 
-					$fieldNamespace = $element->getFieldParamNamespace();
+                $block->setOwner($element);
+                $block->setCollapsed($isCollapsed);
+                $block->setModified($isModified);
+                $block->enabled = $isEnabled;
+                $block->level = $blockLevel;
 
-					if ($fieldNamespace !== null)
-					{
-						$blockNamespace = ($fieldNamespace ? $fieldNamespace . '.' : '') . "$this->handle.$blockId.fields";
-						$block->setFieldParamNamespace($blockNamespace);
-					}
+                $fieldNamespace = $element->getFieldParamNamespace();
 
-					if ($blockFields)
-					{
-						$block->setFieldValues($blockFields);
-					}
+                if ($fieldNamespace !== null)
+                {
+                    $blockNamespace = ($fieldNamespace ? $fieldNamespace . '.' : '') . "$this->handle.$blockId.fields";
+                    $block->setFieldParamNamespace($blockNamespace);
+                }
 
-					if ($prevBlock)
-					{
-						$prevBlock->setNext($block);
-						$block->setPrev($prevBlock);
-					}
+                if ($blockFields)
+                {
+                    $block->setFieldValues($blockFields);
+                }
 
-					$prevBlock = $block;
-					$blocks[] = $block;
-				}
-			}
+                if ($prevBlock)
+                {
+                    $prevBlock->setNext($block);
+                    $block->setPrev($prevBlock);
+                }
 
-			foreach ($blocks as $block)
-			{
-				$block->setAllElements($blocks);
-			}
-		}
+                $prevBlock = $block;
+                $blocks[] = $block;
+            }
+        }
+
+        foreach ($blocks as $block)
+        {
+            $block->setAllElements($blocks);
+        }
 
 		return $blocks;
 	}

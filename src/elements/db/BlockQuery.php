@@ -5,7 +5,6 @@ use yii\base\Exception;
 use yii\db\Connection;
 
 use Craft;
-use craft\base\Element;
 use craft\base\ElementInterface;
 use craft\db\Query;
 use craft\elements\db\ElementQuery;
@@ -39,6 +38,7 @@ class BlockQuery extends ElementQuery
 
 	/**
 	 * @var int|array|null The owner site ID to query for.
+     * @deprecated in 2.4.0. Use [[$siteId]] instead.
 	 */
 	public $ownerSiteId;
 
@@ -74,7 +74,7 @@ class BlockQuery extends ElementQuery
 		{
 			case 'ownerSite':
 			{
-				$this->ownerSite($value);
+                Craft::$app->getDeprecator()->log('BlockQuery::ownerSite()', 'The “ownerSite” Neo block query param has been deprecated. Use “site” or “siteId” instead.');
 			}
 			break;
 			case 'type':
@@ -84,8 +84,7 @@ class BlockQuery extends ElementQuery
 			break;
 			case 'ownerLocale':
 			{
-				$deprecatorService->log('BlockQuery::ownerLocale()', "The “ownerLocale” Neo block query param has been deprecated. Use “ownerSite” or “ownerSiteId” instead.");
-				$this->ownerSite($value);
+				$deprecatorService->log('BlockQuery::ownerLocale()', "The “ownerLocale” Neo block query param has been deprecated. Use “site” or “siteId” instead.");
 			}
 			break;
 			default:
@@ -137,14 +136,9 @@ class BlockQuery extends ElementQuery
 	 * @param int|string|null $value The site ID.
 	 * @return $this
 	 */
-	public function ownerSiteId($value)
+	public function ownerSiteId()
 	{
-		$this->ownerSiteId = $value;
-
-		if ($value && strtolower($value) !== ':empty:')
-		{
-			$this->siteId = (int)$value;
-		}
+        Craft::$app->getDeprecator()->log('BlockQuery::ownerSiteId()', 'The “ownerSiteId” Neo block query param has been deprecated. Use “site” or “siteId” instead.');
 
 		return $this;
 	}
@@ -156,23 +150,9 @@ class BlockQuery extends ElementQuery
 	 * @return $this
 	 * @throws Exception if the site handle is invalid.
 	 */
-	public function ownerSite($value)
+	public function ownerSite()
 	{
-		if ($value instanceof Site)
-		{
-			$this->ownerSiteId($value->id);
-		}
-		else
-		{
-			$site = Craft::$app->getSites()->getSiteByHandle($value);
-
-			if (!$site)
-			{
-				throw new Exception("Invalid site handle: $value");
-			}
-
-			$this->ownerSiteId($site->id);
-		}
+        Craft::$app->getDeprecator()->log('BlockQuery::ownerSiteId()', 'The “ownerSite” Neo block query param has been deprecated. Use “site” or “siteId” instead.');
 
 		return $this;
 	}
@@ -184,10 +164,10 @@ class BlockQuery extends ElementQuery
 	 * @return $this
 	 * @deprecated in 2.0.0.  Use `ownerSite()` or `ownerSiteId()` instead.
 	 */
-	public function ownerLocale($value)
+	public function ownerLocale()
 	{
 		Craft::$app->getDeprecator()->log('ElementQuery::ownerLocale()', "The “ownerLocale” Neo block query param has been deprecated. Use “site” or “siteId” instead.");
-		$this->ownerSite($value);
+//		$this->ownerSite($value);
 
 		return $this;
 	}
@@ -252,10 +232,9 @@ class BlockQuery extends ElementQuery
 	 */
 	public function count($q = '*', $db = null)
 	{
-		$isLivePreview = Craft::$app->getRequest()->getIsLivePreview();
 		$isUsingMemoized = $this->isUsingMemoized();
 
-		if (($isLivePreview || $isUsingMemoized) && isset($this->_allElements))
+		if ($isUsingMemoized && isset($this->_allElements))
 		{
 			$this->setCachedResult($this->_getFilteredResult());
 		}
@@ -268,10 +247,9 @@ class BlockQuery extends ElementQuery
 	 */
 	public function all($db = null)
 	{
-		$isLivePreview = Craft::$app->getRequest()->getIsLivePreview();
 		$isUsingMemoized = $this->isUsingMemoized();
 
-		if (($isLivePreview || $isUsingMemoized) && isset($this->_allElements))
+		if ($isUsingMemoized && isset($this->_allElements))
 		{
 			$this->setCachedResult($this->_getFilteredResult());
 		}
@@ -284,10 +262,9 @@ class BlockQuery extends ElementQuery
 	 */
 	public function one($db = null)
 	{
-		$isLivePreview = Craft::$app->getRequest()->getIsLivePreview();
 		$isUsingMemoized = $this->isUsingMemoized();
 
-		if (($isLivePreview || $isUsingMemoized) && isset($this->_allElements))
+		if ($isUsingMemoized && isset($this->_allElements))
 		{
 			$this->setCachedResult($this->_getFilteredResult());
 		}
@@ -300,10 +277,9 @@ class BlockQuery extends ElementQuery
 	 */
 	public function nth(int $n, Connection $db = null)
 	{
-		$isLivePreview = Craft::$app->getRequest()->getIsLivePreview();
 		$isUsingMemoized = $this->isUsingMemoized();
 
-		if (($isLivePreview || $isUsingMemoized) && isset($this->_allElements))
+		if ($isUsingMemoized && isset($this->_allElements))
 		{
 			$this->setCachedResult($this->_getFilteredResult());
 		}
@@ -356,13 +332,15 @@ class BlockQuery extends ElementQuery
 	 */
 	protected function beforePrepare(): bool
 	{
+
+//	    throw new \Exception(print_r($this, true));
 		$this->joinElementTable('neoblocks');
 
 		$isSaved = $this->id && is_numeric($this->id);
 
 		if ($isSaved)
 		{
-			foreach (['fieldId', 'ownerId', 'ownerSiteId'] as $idProperty)
+			foreach (['fieldId', 'ownerId'] as $idProperty)
 			{
 				if (!$this->$idProperty)
 				{
@@ -373,22 +351,21 @@ class BlockQuery extends ElementQuery
 						->scalar();
 				}
 			}
+		}
 
-			if (!$this->structureId && $this->fieldId && $this->ownerId && $this->ownerSiteId)
+		if (!$this->structureId && $this->fieldId && $this->ownerId)
+		{
+			$blockStructure = Neo::$plugin->blocks->getStructure($this->fieldId, $this->ownerId, (int)$this->siteId);
+
+			if ($blockStructure)
 			{
-				$blockStructure = Neo::$plugin->blocks->getStructure($this->fieldId, $this->ownerId, $this->ownerSiteId);
-
-				if ($blockStructure)
-				{
-					$this->structureId = $blockStructure->structureId;
-				}
+				$this->structureId = $blockStructure->structureId;
 			}
 		}
 
 		$this->query->select([
 			'neoblocks.fieldId',
 			'neoblocks.ownerId',
-			'neoblocks.ownerSiteId',
 			'neoblocks.typeId',
 		]);
 
@@ -400,11 +377,6 @@ class BlockQuery extends ElementQuery
 		if ($this->ownerId)
 		{
 			$this->subQuery->andWhere(Db::parseParam('neoblocks.ownerId', $this->ownerId));
-		}
-
-		if ($this->ownerSiteId)
-		{
-			$this->subQuery->andWhere(Db::parseParam('neoblocks.ownerSiteId', $this->ownerSiteId));
 		}
 
 		if ($this->typeId !== null)
@@ -618,7 +590,8 @@ class BlockQuery extends ElementQuery
 
 		$nextSiblings = [];
 
-		for ($i = $index + 1; $i < count($elements); $i++)
+		$elementsCount = count($elements);
+		for ($i = $index + 1; $i < $elementsCount; $i++)
 		{
 			$element = $elements[$i];
 
@@ -639,6 +612,26 @@ class BlockQuery extends ElementQuery
 
 	// Live Preview methods
 	// These methods must be prefixed with two underscores. They will automatically be detected and used when filtering.
+
+	/**
+	 * @param array $elements
+	 * @param int $value
+	 * @return array
+	 */
+	private function __typeId(array $elements, $value): array
+	{
+		if (!$value)
+		{
+			return $elements;
+		}
+
+		$newElements = array_filter($elements, function($element) use($value)
+		{
+			return in_array($element->typeId, $value);
+		});
+
+		return array_values($newElements);
+	}
 
 	/**
 	 * @param array $elements
@@ -965,7 +958,7 @@ class BlockQuery extends ElementQuery
 	{
 		if (!$value)
 		{
-			$value = Element::STATUS_ENABLED;
+			return $elements;
 		}
 
 		$newElements = array_filter($elements, function($element) use($value)
