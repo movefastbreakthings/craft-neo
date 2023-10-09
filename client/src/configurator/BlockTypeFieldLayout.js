@@ -1,297 +1,227 @@
 import $ from 'jquery'
-
 import Garnish from 'garnish'
 import Craft from 'craft'
-
 import NS from '../namespace'
-
-import ReasonsEditor from '../plugins/reasons/Editor'
 import QuickField from '../plugins/quickfield/QuickField'
 
 const _defaults = {
-	namespace: [],
-	html: '',
-	layout: [],
-	id: -1,
-	blockId: null,
-	blockName: ''
+  namespace: [],
+  html: '',
+  layout: [],
+  id: -1,
+  blockId: null,
+  blockName: ''
 }
-
-let _reasonsInitialised = false
 
 export default Garnish.Base.extend({
 
-	_templateNs: [],
-	_blockName: '',
+  _templateNs: [],
+  _blockName: '',
 
-	init(settings = {})
-	{
-		settings = Object.assign({}, _defaults, settings)
+  init (settings = {}) {
+    settings = Object.assign({}, _defaults, settings)
 
-		this._templateNs = NS.parse(settings.namespace)
-		this._id = settings.id|0
-		this._blockId = settings.blockId
+    this._templateNs = NS.parse(settings.namespace)
+    this._id = settings.id | 0
+    this._blockId = settings.blockId
 
-		this.setBlockName(settings.blockName)
+    this.setBlockName(settings.blockName)
 
-		this.$container = $(settings.html)
-		this.$container.removeAttr('id')
+    this.$container = $(settings.html).find('.layoutdesigner')
+    this.$container.removeAttr('id')
 
-		NS.enter(this._templateNs)
+    NS.enter(this._templateNs)
 
-		this._fld = new Craft.FieldLayoutDesigner(this.$container, {
-			customizableTabs: true,
-			fieldInputName: NS.fieldName('fieldLayout[__TAB_NAME__][]'),
-			requiredFieldInputName: NS.fieldName('requiredFields[]')
-		})
+    this._fld = new Craft.FieldLayoutDesigner(this.$container, {
+      customizableTabs: true,
+      customizableUi: true,
+      elementPlacementInputName: NS.fieldName('elementPlacements[__TAB_NAME__][]'),
+      elementConfigInputName: NS.fieldName('elementConfigs[__ELEMENT_KEY__]')
+    })
 
-		NS.leave()
+    NS.leave()
 
-		this.$instructions = this.$container.find('.instructions')
+    this._tabObserver = new window.MutationObserver(() => {
+      const selector = '[data-type=benf\\\\neo\\\\fieldlayoutelements\\\\ChildBlocksUiElement]'
+      const $uiLibraryElement = this._fld.$uiLibraryElements.filter(selector)
+      const $tabUiElement = this._fld.$tabContainer.find(selector)
+      $uiLibraryElement.toggleClass(
+        'hidden',
+        $tabUiElement.length > 0 || $('body.dragging .draghelper' + selector).length > 0
+      )
+      if ($tabUiElement.hasClass('velocity-animating')) {
+        $tabUiElement.removeClass('hidden')
+      }
+    })
 
-		for(let tab of settings.layout)
-		{
-			let $tab = this.addTab(tab.name)
+    for (const tab of settings.layout) {
+      const $tab = this.addTab(tab.name)
 
-			for(let field of tab.fields)
-			{
-				this.addFieldToTab($tab, field.id, field.required == 1)
-			}
-		}
+      for (const element of tab.elements) {
+        this.addElementToTab($tab, element)
+      }
+    }
 
-		this._patchFLD()
-		this._updateInstructions()
-		this._setupBlankTabs()
-		this._initReasonsPlugin()
-		this._initFieldLabelsPlugin()
-		this._initQuickFieldPlugin()
-	},
+    this._initQuickFieldPlugin()
+  },
 
-	getId()
-	{
-		return this._id
-	},
+  getId () {
+    return this._id
+  },
 
-	getBlockId()
-	{
-		return this._blockId
-	},
+  getBlockId () {
+    return this._blockId
+  },
 
-	getBlockName() { return this._blockName },
-	setBlockName(name)
-	{
-		this._blockName = name
+  getBlockName () { return this._blockName },
+  setBlockName (name) {
+    this._blockName = name
+  },
 
-		this._updateInstructions()
-	},
+  /**
+   * @see Craft.FieldLayoutDesigner.addTab
+   */
+  addTab (name = 'Tab' + (this._fld.tabGrid.$items.length + 1)) {
+    const fld = this._fld
+    const $tab = $(`
+      <div class="fld-tab">
+        <div class="tabs">
+          <div class="tab sel draggable">
+            <span>${name}</span>
+            <a class="settings icon" title="${Craft.t('neo', 'Rename')}"></a>
+          </div>
+        </div>
+        <div class="fld-tabcontent"></div>
+      </div>
+    `).appendTo(fld.$tabContainer)
 
-	/**
-	 * @see Craft.FieldLayoutDesigner.addTab
-	 */
-	addTab(name = 'Tab' + (this._fld.tabGrid.$items.length + 1))
-	{
-		const fld = this._fld
-		const $tab = $(`
-			<div class="fld-tab">
-				<div class="tabs">
-					<div class="tab sel draggable">
-						<span>${name}</span>
-						<a class="settings icon" title="${Craft.t('neo', 'Rename')}"></a>
-					</div>
-				</div>
-				<div class="fld-tabcontent"></div>
-			</div>
-		`).appendTo(fld.$tabContainer)
+    fld.tabGrid.addItems($tab)
+    fld.tabDrag.addItems($tab)
 
-		fld.tabGrid.addItems($tab)
-		fld.tabDrag.addItems($tab)
+    this.$container.appendTo(document.body)
 
-		// In order for tabs to be added to the FLD, the FLD must be visible in the DOM.
-		// To ensure this, the FLD is momentarily placed in the root body element, then after the tab has been added,
-		// it is placed back in the same position it was.
+    fld.initTab($tab)
+    this._tabObserver.observe($tab.children('.fld-tabcontent')[0], { childList: true, subtree: true })
 
-		const $containerNext = this.$container.next()
-		const $containerParent = this.$container.parent()
+    return $tab
+  },
 
-		this.$container.appendTo(document.body)
+  /**
+   * @see Craft.FieldLayoutDesigner.ElementDrag.onDragStop
+   */
+  addElementToTab ($tab, element) {
+    const $elementContainer = $tab.find('.fld-tabcontent')
+    let $element = null
 
-		fld.initTab($tab)
+    if (element.type === 'craft\\fieldlayoutelements\\CustomField') {
+      const $unusedField = this._fld.$fields.filter(`[data-id="${element.id}"]`)
 
-		if($containerNext.length > 0)
-		{
-			$containerNext.before(this.$container)
-		}
-		else
-		{
-			$containerParent.append(this.$container)
-		}
+      // If a field's not required, `element.config.required` should either be `false` or
+      // an empty string, but it seems there was a bug in earlier Craft 3.5 that caused it
+      // to be saved as the string `'0'`
+      const isRequired = element.config.required && element.config.required !== '0'
+      $element = $unusedField.clone().toggleClass('fld-required', isRequired)
+      const $required = $(`<span class="fld-required-indicator" title="${Craft.t('app', 'This field is required')}"></span>`)
+      let $requiredAppendee = $element.find('.fld-element-label')
 
-		this._setupBlankTab($tab)
+      // If `element.config.label` isn't set, this just means the field label hasn't been
+      // overridden in any way, so we don't need to do anything to it
+      if (element.config.label) {
+        // Do we need to hide the label?
+        if (element.config.label === '__blank__') {
+          $requiredAppendee.remove()
 
-		return $tab
-	},
+          if (isRequired) {
+            $requiredAppendee = $element.find('.fld-attribute')
+          }
+        } else {
+          $requiredAppendee.children('h4').text(element.config.label)
+        }
+      }
 
-	/**
-	 * @see Craft.FieldLayoutDesigner.FieldDrag.onDragStop
-	 */
-	addFieldToTab($tab, fieldId, required = null)
-	{
-		required = !!required
+      if (isRequired) {
+        $requiredAppendee.append($required)
+      }
 
-		const $unusedField = this._fld.$allFields.filter(`[data-id="${fieldId}"]`)
-		const $unusedGroup = $unusedField.closest('.fld-tab')
-		const $field = $unusedField.clone().removeClass('unused')
-		const $fieldContainer = $tab.find('.fld-tabcontent')
+      $unusedField.addClass('hidden')
+    } else {
+      $element = this._fld.$uiLibraryElements.filter(function () {
+        const $this = $(this)
+        const type = $this.data('type')
+        const style = $this.data('config').style
 
-		$unusedField.addClass('hidden')
-		if($unusedField.siblings(':not(.hidden)').length === 0)
-		{
-			$unusedGroup.addClass('hidden')
-			this._fld.unusedFieldGrid.removeItems($unusedGroup)
-		}
+        return type === element.type && (!style || style === element.config.style)
+      }).clone()
+      let newLabel = null
 
-		let $fieldInput = $field.find('.id-input')
-		if($fieldInput.length === 0)
-		{
-			let tabName = $tab.find('.tab > span').text()
-			let inputName = this._fld.getFieldInputName(tabName)
+      switch (element.type) {
+        case 'craft\\fieldlayoutelements\\Tip':
+          newLabel = element.config.tip
+          break
 
-			$fieldInput = $(`<input class="id-input" type="hidden" name="${inputName}" value="${fieldId}">`)
-			$field.append($fieldInput)
-		}
+        case 'craft\\fieldlayoutelements\\Heading':
+          newLabel = element.config.heading
+          break
 
-		$field.prepend(`<a class="settings icon" title="${Craft.t('neo', 'Edit')}"></a>`);
-		$fieldContainer.append($field)
-		this._fld.initField($field)
-		this._fld.fieldDrag.addItems($field)
+        case 'craft\\fieldlayoutelements\\Template':
+          newLabel = element.config.template
+          break
+      }
 
-		this.toggleFieldRequire(fieldId, required)
-	},
+      if (newLabel) {
+        const $label = $element.find('.fld-element-label')
+        $label.text(newLabel)
+        $label.toggleClass('code', element.type === 'craft\\fieldlayoutelements\\Template')
+      }
+    }
 
-	toggleFieldRequire(fieldId, required = null)
-	{
-		const $field = this._fld.$tabContainer.find(`[data-id="${fieldId}"]`)
-		const isRequired = $field.hasClass('fld-required')
+    $element.removeClass('unused')
+    $elementContainer.append($element)
+    $element.data('config', element.config)
+    $element.data('settings-html', element['settings-html'])
+    this._fld.initElement($element)
+    this._fld.elementDrag.addItems($element)
+  },
 
-		if(required === null || required !== isRequired)
-		{
-			const $editButton = $field.find('.settings')
-			const menuButton = $editButton.data('menubtn')
-			const menu = menuButton.menu
-			const $options = menu.$options
-			const $requiredOption = $options.filter('.toggle-required')
+  getLayoutStructure () {
+    const tabs = []
+    const elementProperties = ['config', 'id', 'type']
 
-			this._fld.toggleRequiredField($field, $requiredOption)
-		}
-	},
+    this._fld.$tabContainer.children('.fld-tab').each(function () {
+      const $tab = $(this)
+      const tabName = $tab.find('.tab span').text()
+      const tabElements = []
 
-	_patchFLD()
-	{
-		const patch = (method, callback) =>
-		{
-			const superMethod = this._fld[method]
-			this._fld[method] = function()
-			{
-				const returnValue = superMethod.apply(this, arguments)
-				callback.apply(this, arguments)
-				return returnValue
-			}
-		}
+      $tab.find('.fld-element').each(function () {
+        const $element = $(this)
+        const elementData = {}
 
-		patch('initTab', $tab => this._setupBlankTab($tab))
-		patch('renameTab', $tab => this._setupBlankTab($tab))
-	},
+        elementProperties
+          .filter(prop => typeof $element.data(prop) !== 'undefined')
+          .forEach(prop => { elementData[prop] = $element.data(prop) })
 
-	_updateInstructions()
-	{
-		if(this.$instructions)
-		{
-			this.$instructions.html(Craft.t('neo', "For block type {blockType}", {blockType: this.getBlockName() || '&hellip;'}))
-		}
-	},
+        // Do settings-html separately so we can replace the IDs
+        if ($element.data('settings-html')) {
+          elementData['settings-html'] = $element.data('settings-html').replace(
+            /(id|for)="element-([0-9a-z]+)-([a-z-]+)/g,
+            `$1="element-$2-${Date.now()}-$3`
+          )
+        }
 
-	_initReasonsPlugin()
-	{
-		const Reasons = Craft.ReasonsPlugin
+        tabElements.push(elementData)
+      })
 
-		if(Reasons)
-		{
-			const Editor = ReasonsEditor(Reasons.FieldLayoutDesigner)
+      tabs.push({ name: tabName, elements: tabElements })
+    })
 
-			const id = this.getBlockId()
-			const conditionals = Reasons.Neo.conditionals[id]
+    return tabs
+  },
 
-			this._reasons = new Editor(this.$container, conditionals, id)
-		}
-	},
-
-	_destroyReasonsPlugin()
-	{
-		if(this._reasons)
-		{
-			this._reasons.destroy()
-		}
-	},
-
-	_setupBlankTab($tab)
-	{
-		$tab = $($tab)
-		$tab.children('.nc_blanktab').remove()
-
-		const tabName = $tab.find('.tab > span').text()
-		let inputName = this._fld.getFieldInputName(tabName)
-		inputName = inputName.substr(0, inputName.length - 2) // Remove the "[]" array part
-
-		$tab.prepend(`<input type="hidden" class="nc_blanktab" name="${inputName}">`)
-	},
-
-	_setupBlankTabs()
-	{
-		const $tabs = this._fld.$tabContainer.children('.fld-tab')
-		const that = this
-
-		$tabs.each(function()
-		{
-			that._setupBlankTab(this)
-		})
-	},
-
-	_initFieldLabelsPlugin()
-	{
-		if(this._fld.fieldlabels)
-		{
-			const fieldlabels = this._fld.fieldlabels
-
-			const id = this.getBlockId()
-			fieldlabels.namespace = `neo[fieldlabels][${id}]`;
-			fieldlabels.applyLabels(this.getId())
-
-			this._fieldlabels = fieldlabels
-		}
-	},
-
-	_initQuickFieldPlugin()
-	{
-		if(QuickField)
-		{
-			const quickField = new QuickField(this._fld)
-
-			const newGroups = QuickField.getNewGroups()
-			const newFields = QuickField.getNewFields()
-
-			for(let id of Object.keys(newGroups))
-			{
-				let group = newGroups[id]
-				quickField.addGroup(id, group.name)
-			}
-
-			for(let id of Object.keys(newFields))
-			{
-				let field = newFields[id]
-				quickField.addField(id, field.name, field.groupName)
-			}
-
-			this._quickField = quickField
-		}
-	}
+  _initQuickFieldPlugin () {
+    if (QuickField) {
+      const quickField = new QuickField(this._fld)
+      quickField.applyHistory()
+      this._quickField = quickField
+    }
+  }
 })

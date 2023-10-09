@@ -1,14 +1,21 @@
 <?php
+
 namespace benf\neo\converters\models;
 
 use Craft;
 use craft\base\Model;
 use NerdsAndCompany\Schematic\Converters\Models\Base;
 
+if (!class_exists(Base::class)) {
+    return;
+}
+
 /**
  * Neo BlockType Converter for Schematic.
  *
  * {@inheritdoc}
+ * @since 2.1.0
+ * @deprecated in 2.8.0
  */
 class BlockType extends Base
 {

@@ -1,10 +1,10 @@
 {
   "name": "craft-neo",
-  "version": "2.4.0",
+  "version": "2.13.19",
   "description": "A Matrix-like field type that uses existing fields",
   "main": "webpack.config.js",
   "scripts": {
-    "build": "./node_modules/.bin/webpack --config ./client/build/webpack.config.js"
+    "build": "./node_modules/.bin/standard && ./node_modules/.bin/webpack --config ./client/build/webpack.config.js"
   },
   "repository": {
     "type": "git",
@@ -27,11 +27,17 @@
     "babel-loader": "^6.2.4",
     "babel-preset-es2015": "^6.9.0",
     "css-loader": "^0.23.1",
-    "node-sass": "^3.8.0",
+    "node-sass": "^7.0.0",
     "sass-loader": "^4.0.0",
+    "standard": "16.0.3",
     "style-loader": "^0.13.1",
     "twig": "0.8.9",
     "twig-loader": "0.2.1",
     "webpack": "^1.13.1"
+  },
+  "standard": {
+    "ignore": [
+      "src/resources/*.js"
+    ]
   }
 }
