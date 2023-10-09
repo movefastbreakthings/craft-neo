@@ -148,6 +148,12 @@ class Plugin extends BasePlugin
             ->onAdd('neoBlockTypeGroups.{uid}', [$this->blockTypes, 'handleChangedBlockTypeGroup'])
             ->onUpdate('neoBlockTypeGroups.{uid}', [$this->blockTypes, 'handleChangedBlockTypeGroup'])
             ->onRemove('neoBlockTypeGroups.{uid}', [$this->blockTypes, 'handleDeletedBlockTypeGroup']);
+			Event::on(
+				Field::class,
+				'craftQlGetFieldSchema',
+				[CraftQLGetFieldSchema::class, 'handle']
+			);
+	
     }
 
     /**
